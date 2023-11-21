@@ -1,5 +1,8 @@
 import cv2
 import numpy as np
+from scipy.sparse import lil_matrix
+from scipy.sparse.linalg import spsolve
+from tqdm import tqdm
 
 
 def calculate_transform(pointsA, pointsB, mode, useRANSAC):
@@ -33,9 +36,79 @@ def calculate_transform(pointsA, pointsB, mode, useRANSAC):
     # Rather than passing a cv2.RANSAC flag into a transform estimation functions, use flag cv2.USAC_MAGSAC.
     # 
 
-    # TODO
+    if useRANSAC:
+        # RANSAC using OpenCV's functions
+        if mode == 'translation':
+            dx = np.mean(pointsB[:,0] - pointsA[:,0])
+            dy = np.mean(pointsB[:,1] - pointsA[:,1])
+            M = np.array([[1, 0, dx], [0, 1, dy], [0, 0, 1]])
+        elif mode == 'rigid':
+            M, _ = cv2.estimateAffinePartial2D(pointsA, pointsB, method=cv2.USAC_MAGSAC)
+            M = np.vstack([M, [0, 0, 1]]) 
+        elif mode == 'affine':
+            M, _ = cv2.estimateAffine2D(pointsA, pointsB, method=cv2.USAC_MAGSAC)
+            M = np.vstack([M, [0, 0, 1]]) 
+        elif mode == 'homography':
+            M, _ = cv2.findHomography(pointsA, pointsB, method=cv2.RANSAC)
+        else:
+            raise ValueError("Invalid mode")
+    else:
+        # Least squares solutions
+        if mode == 'translation':
+            dx = np.mean(pointsB[:,0] - pointsA[:,0])
+            dy = np.mean(pointsB[:,1] - pointsA[:,1])
+            M = np.array([[1, 0, dx], [0, 1, dy], [0, 0, 1]])
+        elif mode == 'rigid':
+            centroid_A = np.mean(pointsA, axis=0)
+            centroid_B = np.mean(pointsB, axis=0)
 
-    return np.array([[1,0,0],[0,1,0],[0,0,1]])
+            centered_A = pointsA - centroid_A
+            centered_B = pointsB - centroid_B
+
+            H = np.dot(centered_A.T, centered_B)
+
+            U, S, Vt = np.linalg.svd(H)
+
+            R = np.dot(Vt.T, U.T)
+
+            if np.linalg.det(R) < 0:
+                Vt[-1,:] *= -1
+                R = np.dot(Vt.T, U.T)
+
+            t = centroid_B.T - np.dot(R, centroid_A.T)
+
+            M = np.identity(3)
+            M[:2, :2] = R
+            M[:2, 2] = t
+        elif mode == 'affine':
+            assert pointsA.shape[1] == 2 and pointsB.shape[1] == 2
+
+            A = np.hstack([pointsA, np.ones((pointsA.shape[0], 1))])  
+
+            x = np.linalg.lstsq(A, pointsB[:, 0], rcond=None)[0]  
+            y = np.linalg.lstsq(A, pointsB[:, 1], rcond=None)[0]  
+
+            M = np.array([[x[0], x[1], x[2]], 
+                        [y[0], y[1], y[2]], 
+                        [0, 0, 1]])
+        elif mode == 'homography':
+            if len(pointsA) < 4 or len(pointsB) < 4:
+                raise ValueError("At least 4 points are required for homography estimation")
+            A = []
+            for i in range(len(pointsA)):
+                x, y = pointsA[i][0], pointsA[i][1]
+                u, v = pointsB[i][0], pointsB[i][1]
+                A.append([x, y, 1, 0, 0, 0, -u*x, -u*y, -u])
+                A.append([0, 0, 0, x, y, 1, -v*x, -v*y, -v])
+
+            A = np.array(A)
+            U, S, Vh = np.linalg.svd(A)
+            L = Vh[-1,:] / Vh[-1,-1]
+            M = L.reshape(3, 3)
+        else:
+            raise ValueError("Invalid mode")
+    
+    return M
 
 
 def warp_images(A, B, transform_M):
@@ -52,29 +125,23 @@ def warp_images(A, B, transform_M):
         This is basically aligning them as necessary to be composited.
     '''
     
-    # TODO: Step 1 - Find the bounding box of transformed/warped A in the coordinate frame of B
-    #   so that we can determine the dimensions of our composited image.
-    A_rect = ??? # Coordinates of the rectangle defining A
-    warped_A_rect = cv2.perspectiveTransform(A_rect, transform_M) 
+    A_rect = np.array([[0, 0], [A.shape[1], 0], [A.shape[1], A.shape[0]], [0, A.shape[0]]], dtype="float32").reshape(-1, 1, 2)
+    warped_A_rect = cv2.perspectiveTransform(A_rect, transform_M)
 
-    # TODO: Step 2 - Calculate the translation, if any, that is needed to bring A into fully nonnegative coordinates. 
-    #   If we transform A without regard to the bounds, it may get cropped. 
-    translation_xy = ??? 
+    x_min = min(warped_A_rect[:, 0, 0])
+    y_min = min(warped_A_rect[:, 0, 1])
+    translation_xy = (-x_min if x_min < 0 else 0, -y_min if y_min < 0 else 0)
 
-    # TODO: Step 3 - Calculate the width and height of the output image.
-    W = ???
-    H = ???
+    x_max = max(max(warped_A_rect[:, 0, 0]), B.shape[1])
+    y_max = max(max(warped_A_rect[:, 0, 1]), B.shape[0])
+    W, H = x_max + translation_xy[0], y_max + translation_xy[1]
 
-    # TODO: Create a translation transform T that translates B to account for any shift of A. This is a 2x3 affine matrix representing the translation.
-    transform_T = ???
+    transform_T = np.array([[1, 0, translation_xy[0]], [0, 1, translation_xy[1]]], dtype="float32")
 
-    # Update transform M with the translation needed to keep A in frame.
-    transform_M = np.concatenate((transform_T, [[0, 0, 1]]), axis=0) @ transform_M
+    transform_M = np.dot(np.concatenate((transform_T, [[0, 0, 1]]), axis=0), transform_M)
 
-
-    # Create the warped images
-    warped_A = cv2.warpPerspective(A, transform_M, (int(W),int(H)))
-    warped_B = cv2.warpAffine(B, transform_T, (int(W),int(H)))
+    warped_A = cv2.warpPerspective(A, transform_M, (int(W), int(H)))
+    warped_B = cv2.warpAffine(B, transform_T, (int(W), int(H)))
 
     return warped_A, warped_B
 
@@ -83,8 +150,21 @@ def composite(imgA, imgB):
     '''
     Composite imgA and imgB, both of which have already been warped by warp_images
     '''
-    assert(imgA.shape == imgB.shape)
+    if imgA.shape[2] == 4:
+        imgA = imgA[:, :, 0:3]
+    imgA_uint8 = imgA.astype(np.uint8)
 
-    out = np.zeros(imgA.shape, dtype=np.float32)  # TODO
+    if imgB.shape[2] == 4:
+        imgB = imgB[:, :, 0:3]
+    imgB_uint8 = imgB.astype(np.uint8)
 
-    return out
+    grayA = cv2.cvtColor(imgA, cv2.COLOR_BGR2GRAY)
+    maskA = grayA > 0
+    maskA_uint8 = maskA.astype(np.uint8)
+    maskA_expanded = np.expand_dims(maskA_uint8, axis=-1)
+    maskA_expanded = np.repeat(maskA_expanded, 3, axis=-1)
+
+    imgA_uint8 = imgA.astype(np.uint8)
+    imgB_uint8 = imgB.astype(np.uint8)
+
+    return (imgA_uint8 * maskA_expanded) + (imgB_uint8 * (1 - maskA_expanded))

@@ -44,4 +44,8 @@ def getFocalLengthInPixels( focalLengthMM, imageWidthPixels, sensorWidthMM ):
     # - The focal length is the perpendicular distance from the center of projection to the sensor plane
     # - The ratio between the focal length in pixels (unknown) and the focal length in mm  is the same as  the ratio between the image width in pixels and the sensor width in mm
     
-    return 1 # TODO To replace
+    if focalLengthMM is None or imageWidthPixels is None or sensorWidthMM is None:
+        return None
+
+    focalLengthInPixels = (focalLengthMM / sensorWidthMM) * imageWidthPixels
+    return focalLengthInPixels
